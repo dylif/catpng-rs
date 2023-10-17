@@ -22,7 +22,7 @@ enum PngChunkType {
     Iend,
 }
 struct PngChunk {
-    type_: PngChunkType,
+    type_code: PngChunkType,
     data: Box<[u8]>,
 }
 
@@ -44,7 +44,7 @@ impl PngChunk {
         let length = u32::from_be_bytes(buf) as usize;
 
         reader.read_exact(&mut buf)?;
-        let type_: PngChunkType = match buf.as_slice() {
+        let type_code: PngChunkType = match buf.as_slice() {
             PNG_CHUNK_IHDR_TYPE => PngChunkType::Ihdr,
             PNG_CHUNK_IDAT_TYPE => PngChunkType::Idat,
             PNG_CHUNK_IEND_TYPE => PngChunkType::Iend,
@@ -56,17 +56,25 @@ impl PngChunk {
             }
         };
 
-        let mut data = vec![0u8; length].into_boxed_slice();
-        reader.read_exact(&mut data)?;
+        let mut data = Vec::with_capacity(length);
+        if reader.take(length as u64).read_to_end(&mut data)? != length {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "Actual chunk data length < chunk length",
+            ));
+        }
 
         // Skip over CRC
         reader.read_exact(&mut buf)?;
 
-        Ok(Self { type_, data })
+        Ok(Self {
+            type_code,
+            data: data.into_boxed_slice(),
+        })
     }
 
     fn is_ihdr(&self) -> bool {
-        self.type_ == PngChunkType::Ihdr && self.data.len() == PNG_CHUNK_IHDR_LEN
+        self.type_code == PngChunkType::Ihdr && self.data.len() == PNG_CHUNK_IHDR_LEN
     }
 
     fn to_ihdr_data(&self) -> Result<IhdrData, io::Error> {
@@ -111,30 +119,29 @@ impl PngChunk {
 
     fn iend() -> Self {
         Self {
-            type_: PngChunkType::Iend,
+            type_code: PngChunkType::Iend,
             data: Box::new([]),
         }
     }
 
     fn write(&self, writer: &mut impl Write) -> Result<(), io::Error> {
         writer.write_all(
-            u32::try_from(self.data.len())
+            &u32::try_from(self.data.len())
                 .expect("Chunk data length exceeds bounds of u32")
-                .to_be_bytes()
-                .as_slice(),
+                .to_be_bytes(),
         )?;
 
-        let type_ = match self.type_ {
+        let type_code = match self.type_code {
             PngChunkType::Ihdr => PNG_CHUNK_IHDR_TYPE,
             PngChunkType::Idat => PNG_CHUNK_IDAT_TYPE,
             PngChunkType::Iend => PNG_CHUNK_IEND_TYPE,
         };
-        writer.write_all(type_)?;
+        writer.write_all(type_code)?;
 
         writer.write_all(&self.data)?;
 
         let mut hasher = Hasher::new();
-        hasher.update(type_);
+        hasher.update(type_code);
         hasher.update(&self.data);
         writer.write_all(&(hasher.finalize().to_be_bytes()))?;
 
@@ -144,7 +151,7 @@ impl PngChunk {
 
 impl IhdrData {
     fn to_chunk(&self) -> PngChunk {
-        let type_ = PngChunkType::Ihdr;
+        let type_code = PngChunkType::Ihdr;
         let mut data = Vec::with_capacity(PNG_CHUNK_IHDR_LEN);
         data.extend_from_slice(&self.width.to_be_bytes());
         data.extend_from_slice(&self.height.to_be_bytes());
@@ -155,7 +162,7 @@ impl IhdrData {
         data.push(self.interlace);
 
         PngChunk {
-            type_,
+            type_code,
             data: data.into_boxed_slice(),
         }
     }
@@ -197,7 +204,7 @@ fn write_out(path: &str, saved: &IhdrData, infl_buf: &mut [u8], level: u8) -> Re
     saved.to_chunk().write(&mut file)?;
 
     PngChunk {
-        type_: PngChunkType::Idat,
+        type_code: PngChunkType::Idat,
         data: compress_to_vec_zlib(infl_buf, level).into_boxed_slice(),
     }
     .write(&mut file)?;
@@ -218,7 +225,7 @@ fn main() -> Result<()> {
     let level: u8 = args[args.len() - 1]
         .trim()
         .parse()
-        .context("Failed to parse compression level (should be 0-9)")?;
+        .context("Failed to parse compression level (should be 0-10)")?;
 
     for path in &args[..args.len() - 2] {
         if let Err(why) = process_png(path, &mut saved, &mut infl_buf) {
