@@ -127,7 +127,7 @@ impl PngChunk {
     fn write(&self, writer: &mut impl Write) -> Result<(), io::Error> {
         writer.write_all(
             &u32::try_from(self.data.len())
-                .expect("Chunk data length exceeds bounds of u32")
+                .expect("u32 chunk length")
                 .to_be_bytes(),
         )?;
 
