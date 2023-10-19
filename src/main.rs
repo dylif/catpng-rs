@@ -21,6 +21,7 @@ enum PngChunkType {
     Idat,
     Iend,
 }
+
 struct PngChunk {
     type_code: PngChunkType,
     data: Box<[u8]>,
@@ -82,13 +83,6 @@ impl PngChunk {
             return Err(io::Error::new(
                 io::ErrorKind::Other,
                 "Cannot convert non-IHDR chunk to IhdrData",
-            ));
-        }
-
-        if self.data.len() != PNG_CHUNK_IHDR_LEN {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                "IHDR chunk has incorrect length",
             ));
         }
 
