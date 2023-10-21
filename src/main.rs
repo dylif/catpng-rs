@@ -6,6 +6,7 @@ use anyhow::{bail, Context, Result};
 use crc32fast::Hasher;
 use miniz_oxide::deflate::compress_to_vec_zlib;
 use miniz_oxide::inflate::decompress_to_vec_zlib;
+use thiserror::Error;
 
 const USAGE: &str = "Usage: FILE... OUTPUT COMPRESSION";
 
@@ -15,7 +16,7 @@ const PNG_CHUNK_IDAT_TYPE: &[u8] = b"IDAT";
 const PNG_CHUNK_IEND_TYPE: &[u8] = b"IEND";
 const PNG_CHUNK_IHDR_LEN: usize = 13;
 
-#[derive(PartialEq)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 enum PngChunkType {
     Ihdr,
     Idat,
@@ -37,8 +38,23 @@ struct IhdrData {
     interlace: u8,
 }
 
+#[derive(Error, Debug)]
+enum PngChunkError {
+    #[error("IO error {source}")]
+    Io {
+        #[from]
+        source: io::Error,
+    },
+    #[error("unsupported chunk type {0:?}")]
+    UnsupportedType([u8; 4]),
+    #[error("expected a chunk type of Ihdr, got {0:?}")]
+    InvalidIhdrType(PngChunkType),
+    #[error("expected a chunk length of {}, got {0}", PNG_CHUNK_IHDR_LEN)]
+    InvalidIhdrLength(usize),
+}
+
 impl PngChunk {
-    fn from_read(reader: &mut impl Read) -> Result<Self, io::Error> {
+    fn from_read(reader: &mut impl Read) -> Result<Self, PngChunkError> {
         let mut buf = [0u8; 4];
 
         reader.read_exact(&mut buf)?;
@@ -50,19 +66,18 @@ impl PngChunk {
             PNG_CHUNK_IDAT_TYPE => PngChunkType::Idat,
             PNG_CHUNK_IEND_TYPE => PngChunkType::Iend,
             _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "Unknown PNG chunk type",
-                ))
+                return Err(PngChunkError::UnsupportedType(buf));
             }
         };
 
         let mut data = Vec::with_capacity(length);
         if reader.take(length as u64).read_to_end(&mut data)? != length {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "Actual chunk data length < chunk length",
-            ));
+            return Err(PngChunkError::Io {
+                source: io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "actual chunk data length < chunk length",
+                ),
+            });
         }
 
         // Skip over CRC
@@ -74,17 +89,20 @@ impl PngChunk {
         })
     }
 
-    fn is_ihdr(&self) -> bool {
-        self.type_code == PngChunkType::Ihdr && self.data.len() == PNG_CHUNK_IHDR_LEN
+    fn verify_ihdr(&self) -> Result<(), PngChunkError> {
+        if self.type_code != PngChunkType::Ihdr {
+            return Err(PngChunkError::InvalidIhdrType(self.type_code));
+        }
+
+        if self.data.len() != PNG_CHUNK_IHDR_LEN {
+            return Err(PngChunkError::InvalidIhdrLength(self.data.len()));
+        }
+
+        Ok(())
     }
 
-    fn to_ihdr_data(&self) -> Result<IhdrData, io::Error> {
-        if !self.is_ihdr() {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                "Cannot convert non-IHDR chunk to IhdrData",
-            ));
-        }
+    fn to_ihdr_data(&self) -> Result<IhdrData> {
+        self.verify_ihdr()?;
 
         let mut buf = [0u8; 4];
 
@@ -118,7 +136,7 @@ impl PngChunk {
         }
     }
 
-    fn write(&self, writer: &mut impl Write) -> Result<(), io::Error> {
+    fn write(&self, writer: &mut impl Write) -> Result<(), PngChunkError> {
         writer.write_all(
             &u32::try_from(self.data.len())
                 .expect("u32 chunk length")
