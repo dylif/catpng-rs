@@ -69,28 +69,14 @@ impl PngChunk {
     fn to_ihdr_data(&self) -> Result<IhdrData, PngChunkError> {
         self.verify_ihdr()?;
 
-        let mut buf = [0u8; 4];
-
-        buf.copy_from_slice(&self.data[0..4]);
-        let width = u32::from_be_bytes(buf);
-
-        buf.copy_from_slice(&self.data[4..8]);
-        let height = u32::from_be_bytes(buf);
-
-        let bit_depth = self.data[8];
-        let color_type = self.data[9];
-        let compression = self.data[10];
-        let filter = self.data[11];
-        let interlace = self.data[12];
-
         Ok(IhdrData {
-            width,
-            height,
-            bit_depth,
-            color_type,
-            compression,
-            filter,
-            interlace,
+            width: u32::from_be_bytes(self.data[0..4].try_into().expect("4 byte sequence")),
+            height: u32::from_be_bytes(self.data[4..8].try_into().expect("4 byte sequence")),
+            bit_depth: self.data[8],
+            color_type: self.data[9],
+            compression: self.data[10],
+            filter: self.data[11],
+            interlace: self.data[12],
         })
     }
 
@@ -169,9 +155,7 @@ impl IhdrData {
     fn to_chunk(&self) -> PngChunk {
         PngChunk {
             type_code: PngChunkType::Ihdr,
-            data: self
-                .width
-                .to_be_bytes()
+            data: (self.width.to_be_bytes())
                 .into_iter()
                 .chain(self.height.to_be_bytes())
                 .chain([
