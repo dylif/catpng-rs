@@ -54,6 +54,41 @@ enum PngChunkError {
 }
 
 impl PngChunk {
+    fn try_from_read<T: Read>(reader: &mut T) -> Result<Self, PngChunkError> {
+        let mut buf = [0u8; 4];
+
+        reader.read_exact(&mut buf)?;
+        let length = u32::from_be_bytes(buf) as usize;
+
+        reader.read_exact(&mut buf)?;
+        let type_code: PngChunkType = match buf.as_slice() {
+            PNG_CHUNK_IHDR_TYPE => PngChunkType::Ihdr,
+            PNG_CHUNK_IDAT_TYPE => PngChunkType::Idat,
+            PNG_CHUNK_IEND_TYPE => PngChunkType::Iend,
+            _ => {
+                return Err(PngChunkError::UnsupportedType(buf));
+            }
+        };
+
+        let mut data = Vec::with_capacity(0);
+        data.reserve_exact(length);
+        if reader.take(length as u64).read_to_end(&mut data)? != length {
+            return Err(PngChunkError::Io {
+                source: io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "actual chunk data length < chunk length",
+                ),
+            });
+        }
+
+        // Skip over CRC
+        reader.read_exact(&mut buf)?;
+
+        Ok(Self {
+            type_code,
+            data: data.into_boxed_slice(),
+        })
+    }
     fn verify_ihdr(&self) -> Result<(), PngChunkError> {
         if self.type_code != PngChunkType::Ihdr {
             return Err(PngChunkError::InvalidIhdrType(self.type_code));
@@ -112,45 +147,6 @@ impl PngChunk {
     }
 }
 
-impl TryFrom<&mut dyn Read> for PngChunk {
-    type Error = PngChunkError;
-
-    fn try_from(reader: &mut dyn Read) -> Result<Self, Self::Error> {
-        let mut buf = [0u8; 4];
-
-        reader.read_exact(&mut buf)?;
-        let length = u32::from_be_bytes(buf) as usize;
-
-        reader.read_exact(&mut buf)?;
-        let type_code: PngChunkType = match buf.as_slice() {
-            PNG_CHUNK_IHDR_TYPE => PngChunkType::Ihdr,
-            PNG_CHUNK_IDAT_TYPE => PngChunkType::Idat,
-            PNG_CHUNK_IEND_TYPE => PngChunkType::Iend,
-            _ => {
-                return Err(PngChunkError::UnsupportedType(buf));
-            }
-        };
-
-        let mut data = Vec::with_capacity(length);
-        if reader.take(length as u64).read_to_end(&mut data)? != length {
-            return Err(PngChunkError::Io {
-                source: io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "actual chunk data length < chunk length",
-                ),
-            });
-        }
-
-        // Skip over CRC
-        reader.read_exact(&mut buf)?;
-
-        Ok(Self {
-            type_code,
-            data: data.into_boxed_slice(),
-        })
-    }
-}
-
 impl IhdrData {
     fn to_chunk(&self) -> PngChunk {
         PngChunk {
@@ -178,7 +174,7 @@ fn process_png(path: &str, saved: &mut Option<IhdrData>, infl_buf: &mut Vec<u8>)
         bail!("Invalid PNG signature");
     }
 
-    let chunk = PngChunk::try_from(&mut file as &mut dyn Read)?;
+    let chunk = PngChunk::try_from_read(&mut file)?;
     let ihdr = chunk.to_ihdr_data()?;
 
     if let Some(x) = saved {
@@ -187,7 +183,7 @@ fn process_png(path: &str, saved: &mut Option<IhdrData>, infl_buf: &mut Vec<u8>)
         }
     }
 
-    let chunk = PngChunk::try_from(&mut file as &mut dyn Read)?;
+    let chunk = PngChunk::try_from_read(&mut file)?;
     infl_buf.append(&mut decompress_to_vec_zlib(&chunk.data)?);
 
     match saved {
