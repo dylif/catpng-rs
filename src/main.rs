@@ -1,33 +1,147 @@
 use std::env;
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufReader, Read, Write};
+use std::io::{self, BufReader, Cursor, Read, Seek, Write};
+use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
+use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use crc32fast::Hasher;
 use miniz_oxide::deflate::compress_to_vec_zlib;
-use miniz_oxide::inflate::decompress_to_vec_zlib;
+use miniz_oxide::inflate::{decompress_to_vec_zlib, DecompressError};
 use thiserror::Error;
 
-const USAGE: &str = "Usage: FILE... OUTPUT COMPRESSION";
+const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\x0D\x0A\x1A\x0A";
 
-const PNG_SIGNATURE: &[u8] = b"\x89PNG\x0D\x0A\x1A\x0A";
-const PNG_CHUNK_IHDR_TYPE: &[u8] = b"IHDR";
-const PNG_CHUNK_IDAT_TYPE: &[u8] = b"IDAT";
-const PNG_CHUNK_IEND_TYPE: &[u8] = b"IEND";
-const PNG_CHUNK_IHDR_LEN: usize = 13;
+#[derive(Error, Debug)]
+enum PngError {
+    #[error("IO error")]
+    Io(#[from] io::Error),
+    #[error("Decompress error")]
+    Decompress(#[from] DecompressError),
+    #[error("invalid PNG file signature")]
+    InvalidSignature,
+    #[error("unsupported chunk type code {0:?}")]
+    UnsupportedTypeCode([u8; 4]),
+    #[error("invalid IHDR length")]
+    InvalidIhdrLength,
+    #[error("chunk type code is not IHDR")]
+    NotIhdr,
+    #[error("png width is not equal to the first's")]
+    UnequalWidth,
+}
 
 #[derive(Debug, PartialEq, Clone, Copy)]
-enum PngChunkType {
+enum PngChunkKind {
     Ihdr,
     Idat,
     Iend,
 }
 
+impl PngChunkKind {
+    const IHDR: &'static [u8; 4] = b"IHDR";
+    const IDAT: &'static [u8; 4] = b"IDAT";
+    const IEND: &'static [u8; 4] = b"IEND";
+}
+
+impl TryFrom<&[u8; 4]> for PngChunkKind {
+    type Error = PngError;
+    fn try_from(type_code: &[u8; 4]) -> Result<Self, Self::Error> {
+        use PngChunkKind::*;
+        match type_code {
+            PngChunkKind::IHDR => Ok(Ihdr),
+            PngChunkKind::IDAT => Ok(Idat),
+            PngChunkKind::IEND => Ok(Iend),
+            _ => Err(PngError::UnsupportedTypeCode(*type_code)),
+        }
+    }
+}
+
+impl From<PngChunkKind> for &[u8; 4] {
+    fn from(kind: PngChunkKind) -> Self {
+        use PngChunkKind::*;
+        match kind {
+            Ihdr => PngChunkKind::IHDR,
+            Idat => PngChunkKind::IDAT,
+            Iend => PngChunkKind::IEND,
+        }
+    }
+}
+
+#[derive(Debug)]
 struct PngChunk {
-    type_code: PngChunkType,
+    kind: PngChunkKind,
     data: Box<[u8]>,
 }
 
+trait ReadExactExt: Read {
+    #[inline]
+    fn read_exact_capacity(&mut self, buf: &mut Vec<u8>) -> io::Result<usize> {
+        self.take(buf.capacity() as u64)
+            .read_to_end(buf)
+            .and_then(|n| {
+                if n < buf.capacity() {
+                    Err(io::Error::from(io::ErrorKind::UnexpectedEof))
+                } else {
+                    Ok(n)
+                }
+            })
+    }
+}
+
+impl<R: Read> ReadExactExt for R {}
+
+impl PngChunk {
+    fn new<T: Read + Seek>(reader: &mut T) -> Result<Self, PngError> {
+        let mut buf = [0u8; 4];
+
+        let length = reader.read_u32::<BigEndian>()? as usize;
+
+        reader.read_exact(&mut buf)?;
+        let kind = PngChunkKind::try_from(&buf)?;
+
+        if kind == PngChunkKind::Ihdr && length != 13 {
+            return Err(PngError::InvalidIhdrLength);
+        }
+
+        // Optimization: Only performs one allocation for the data buffer
+        let mut data = Vec::new();
+        data.reserve_exact(length);
+        reader.read_exact_capacity(&mut data)?;
+
+        // Intentionally skip over CRC
+        reader.read_exact(&mut buf)?;
+
+        Ok(Self {
+            kind,
+            data: data.into_boxed_slice(),
+        })
+    }
+
+    fn write<T: Write>(&self, writer: &mut T) -> io::Result<()> {
+        writer.write_u32::<BigEndian>(self.data.len() as u32)?;
+
+        let type_code: &[u8; 4] = self.kind.into();
+        writer.write_all(type_code)?;
+
+        writer.write_all(&self.data)?;
+
+        let mut hasher = Hasher::new();
+        hasher.update(type_code);
+        hasher.update(&self.data);
+        writer.write_u32::<BigEndian>(hasher.finalize())?;
+
+        Ok(())
+    }
+
+    fn iend() -> Self {
+        Self {
+            kind: PngChunkKind::Iend,
+            data: Box::new([]),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
 struct IhdrData {
     width: u32,
     height: u32,
@@ -38,205 +152,209 @@ struct IhdrData {
     interlace: u8,
 }
 
-#[derive(Error, Debug)]
-enum PngChunkError {
-    #[error("IO error {source}")]
-    Io {
-        #[from]
-        source: io::Error,
-    },
-    #[error("unsupported chunk type {0:?}")]
-    UnsupportedType([u8; 4]),
-    #[error("expected a chunk type of Ihdr, got {0:?}")]
-    InvalidIhdrType(PngChunkType),
-    #[error("expected a chunk length of {}, got {0}", PNG_CHUNK_IHDR_LEN)]
-    InvalidIhdrLength(usize),
-}
+impl TryFrom<&PngChunk> for IhdrData {
+    type Error = PngError;
 
-impl PngChunk {
-    fn try_from_read<T: Read>(reader: &mut T) -> Result<Self, PngChunkError> {
-        let mut buf = [0u8; 4];
-
-        reader.read_exact(&mut buf)?;
-        let length = u32::from_be_bytes(buf) as usize;
-
-        reader.read_exact(&mut buf)?;
-        let type_code: PngChunkType = match buf.as_slice() {
-            PNG_CHUNK_IHDR_TYPE => PngChunkType::Ihdr,
-            PNG_CHUNK_IDAT_TYPE => PngChunkType::Idat,
-            PNG_CHUNK_IEND_TYPE => PngChunkType::Iend,
-            _ => {
-                return Err(PngChunkError::UnsupportedType(buf));
-            }
-        };
-
-        let mut data = Vec::with_capacity(0);
-        data.reserve_exact(length);
-        if reader.take(length as u64).read_to_end(&mut data)? != length {
-            return Err(PngChunkError::Io {
-                source: io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "actual chunk data length < chunk length",
-                ),
-            });
+    fn try_from(chunk: &PngChunk) -> Result<Self, Self::Error> {
+        if chunk.kind != PngChunkKind::Ihdr {
+            return Err(PngError::NotIhdr);
         }
 
-        // Skip over CRC
-        reader.read_exact(&mut buf)?;
-
-        Ok(Self {
-            type_code,
-            data: data.into_boxed_slice(),
-        })
-    }
-    fn verify_ihdr(&self) -> Result<(), PngChunkError> {
-        if self.type_code != PngChunkType::Ihdr {
-            return Err(PngChunkError::InvalidIhdrType(self.type_code));
-        }
-
-        if self.data.len() != PNG_CHUNK_IHDR_LEN {
-            return Err(PngChunkError::InvalidIhdrLength(self.data.len()));
-        }
-
-        Ok(())
-    }
-
-    fn to_ihdr_data(&self) -> Result<IhdrData, PngChunkError> {
-        self.verify_ihdr()?;
-
+        let mut cursor = Cursor::new(chunk.data.as_ref());
         Ok(IhdrData {
-            width: u32::from_be_bytes(self.data[0..4].try_into().expect("4 byte sequence")),
-            height: u32::from_be_bytes(self.data[4..8].try_into().expect("4 byte sequence")),
-            bit_depth: self.data[8],
-            color_type: self.data[9],
-            compression: self.data[10],
-            filter: self.data[11],
-            interlace: self.data[12],
+            width: cursor.read_u32::<BigEndian>()?,
+            height: cursor.read_u32::<BigEndian>()?,
+            bit_depth: cursor.read_u8()?,
+            color_type: cursor.read_u8()?,
+            compression: cursor.read_u8()?,
+            filter: cursor.read_u8()?,
+            interlace: cursor.read_u8()?,
         })
     }
-
-    fn iend() -> Self {
-        Self {
-            type_code: PngChunkType::Iend,
-            data: Box::new([]),
-        }
-    }
-
-    fn write(&self, writer: &mut impl Write) -> Result<(), PngChunkError> {
-        writer.write_all(
-            &u32::try_from(self.data.len())
-                .expect("u32 chunk length")
-                .to_be_bytes(),
-        )?;
-
-        let type_code = match self.type_code {
-            PngChunkType::Ihdr => PNG_CHUNK_IHDR_TYPE,
-            PngChunkType::Idat => PNG_CHUNK_IDAT_TYPE,
-            PngChunkType::Iend => PNG_CHUNK_IEND_TYPE,
-        };
-        writer.write_all(type_code)?;
-
-        writer.write_all(&self.data)?;
-
-        let mut hasher = Hasher::new();
-        hasher.update(type_code);
-        hasher.update(&self.data);
-        writer.write_all(&(hasher.finalize().to_be_bytes()))?;
-
-        Ok(())
-    }
 }
 
-impl IhdrData {
-    fn to_chunk(&self) -> PngChunk {
+impl From<IhdrData> for PngChunk {
+    fn from(ihdr: IhdrData) -> Self {
+        // Optimization: Only performs one allocation for the data buffer
+        let mut data = Vec::new();
+        data.reserve_exact(13);
+
+        // Convert to Options here to ignore Result without using let _ = ... since that's too aggressive
+        data.write_u32::<BigEndian>(ihdr.width).ok();
+        data.write_u32::<BigEndian>(ihdr.height).ok();
+        data.write_u8(ihdr.bit_depth).ok();
+        data.write_u8(ihdr.color_type).ok();
+        data.write_u8(ihdr.compression).ok();
+        data.write_u8(ihdr.filter).ok();
+        data.write_u8(ihdr.interlace).ok();
+
         PngChunk {
-            type_code: PngChunkType::Ihdr,
-            data: (self.width.to_be_bytes())
-                .into_iter()
-                .chain(self.height.to_be_bytes())
-                .chain([
-                    self.bit_depth,
-                    self.color_type,
-                    self.compression,
-                    self.filter,
-                    self.interlace,
-                ])
-                .collect(),
+            kind: PngChunkKind::Ihdr,
+            data: data.into_boxed_slice(),
         }
     }
 }
 
-fn process_png(path: &str, saved: &mut Option<IhdrData>, infl_buf: &mut Vec<u8>) -> Result<()> {
-    let mut file = BufReader::new(File::open(path)?);
-
-    let mut signature_buf = [0u8; PNG_SIGNATURE.len()];
-    if file.read_exact(&mut signature_buf).is_err() || signature_buf != PNG_SIGNATURE {
-        bail!("Invalid PNG signature");
-    }
-
-    let chunk = PngChunk::try_from_read(&mut file)?;
-    let ihdr = chunk.to_ihdr_data()?;
-
-    if let Some(x) = saved {
-        if ihdr.width != x.width {
-            bail!("Width does not match width of first PNG");
+fn catpng<T, U>(pngs: T, level: u8) -> Result<(IhdrData, PngChunk)>
+where
+    T: IntoIterator<Item = (U, PathBuf)>,
+    U: Read + Seek,
+{
+    let inflate_png = |(mut saved, mut buf): (Option<IhdrData>, Vec<u8>), mut png: U| {
+        let mut signature_buf = [0u8; PNG_SIGNATURE.len()];
+        if png.read_exact(&mut signature_buf).is_err() || signature_buf != *PNG_SIGNATURE {
+            return Err(PngError::InvalidSignature);
         }
-    }
 
-    let chunk = PngChunk::try_from_read(&mut file)?;
-    infl_buf.append(&mut decompress_to_vec_zlib(&chunk.data)?);
+        let ihdr = IhdrData::try_from(&PngChunk::new(&mut png)?)?;
 
-    match saved {
-        Some(x) => x.height += ihdr.height,
-        None => *saved = Some(ihdr),
+        if saved
+            .as_ref()
+            .is_some_and(|saved| saved.width != ihdr.width)
+        {
+            return Err(PngError::UnequalWidth);
+        }
+
+        buf.append(&mut decompress_to_vec_zlib(&PngChunk::new(&mut png)?.data)?);
+
+        if let Some(ref mut saved) = saved {
+            saved.height += ihdr.height;
+        } else {
+            saved = Some(ihdr);
+        }
+
+        Ok((saved, buf))
     };
 
-    Ok(())
+    pngs.into_iter()
+        .try_fold((None, Vec::new()), |a, (reader, path)| {
+            inflate_png(a, reader)
+                .with_context(|| format!("failed to process `{}`", path.display()))
+        })
+        .map(|(saved, buf)| {
+            (
+                saved.expect("output IHDR"),
+                PngChunk {
+                    kind: PngChunkKind::Idat,
+                    data: compress_to_vec_zlib(&buf, level).into_boxed_slice(),
+                },
+            )
+        })
 }
 
-fn write_out(path: &str, saved: &IhdrData, infl_buf: &mut [u8], level: u8) -> Result<()> {
-    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
-
-    file.write_all(PNG_SIGNATURE)?;
-    saved.to_chunk().write(&mut file)?;
-
-    PngChunk {
-        type_code: PngChunkType::Idat,
-        data: compress_to_vec_zlib(infl_buf, level).into_boxed_slice(),
+fn write_png<T: Write>((ihdr, idat): (IhdrData, PngChunk), writer: &mut T) -> io::Result<()> {
+    writer.write_all(PNG_SIGNATURE)?;
+    for c in [ihdr.into(), idat, PngChunk::iend()] {
+        c.write(writer)?;
     }
-    .write(&mut file)?;
-    PngChunk::iend().write(&mut file)?;
 
     Ok(())
 }
 
 fn main() -> Result<()> {
-    let args: Vec<String> = env::args().skip(1).collect();
-    let mut saved: Option<IhdrData> = None;
-    let mut infl_buf = Vec::new();
+    const USAGE: &str = "Usage: OUTPUT LEVEL INPUT...\n\tOUTPUT: The output file path\n\tLEVEL: The output file compression level (0-10, default: 10)\n\tINPUT: The input file(s)";
 
-    if args.len() < 3 {
-        bail!(USAGE);
-    }
+    let mut args = env::args().skip(1).peekable();
 
-    let level: u8 = args[args.len() - 1]
-        .trim()
-        .parse()
-        .context("Failed to parse compression level (should be 0-10)")?;
-
-    for path in &args[..args.len() - 2] {
-        if let Err(why) = process_png(path, &mut saved, &mut infl_buf) {
-            eprintln!("Skipping \"{path}\": {why}");
-        }
-    }
-
-    let file = args[args.len() - 2].as_str();
-    match saved {
-        None => bail!("Failed to process at least one PNG"),
-        Some(x) => {
-            write_out(file, &x, &mut infl_buf, level).context("Failed to write output PNG")?;
+    let (out_path, out_level, _) = match (
+        args.next(),
+        args.next().and_then(|s| s.trim().parse().ok()),
+        args.peek(),
+    ) {
+        (Some(path), Some(level), Some(_)) => (path, level, ()),
+        _ => {
+            eprintln!("{}", USAGE);
+            bail!("Invalid argument(s)");
         }
     };
 
+    let mut pngs = Vec::new();
+    for path in args {
+        pngs.push((BufReader::new(File::open(&path)?), PathBuf::from(path)));
+    }
+
+    let (out_ihdr, out_idat) = catpng(pngs, out_level)?;
+
+    dbg!(out_ihdr);
+
+    let mut out_file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(out_path)?;
+
+    write_png((out_ihdr, out_idat), &mut out_file)?;
+
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    macro_rules! ihdr {
+        { $w:expr, $h:expr, $b:expr, $c:expr, $z:expr, $f:expr, $i:expr } => {
+            IhdrData {
+                width: $w,
+                height: $h,
+                bit_depth: $b,
+                color_type: $c,
+                compression: $z,
+                filter: $f,
+                interlace: $i,
+            }
+        };
+    }
+
+    fn png_vec(ihdr: IhdrData, data: &[u8], level: u8) -> Result<Vec<u8>> {
+        let mut buf = Vec::new();
+        write_png(
+            (
+                ihdr,
+                PngChunk {
+                    kind: PngChunkKind::Idat,
+                    data: compress_to_vec_zlib(data, level).into_boxed_slice(),
+                },
+            ),
+            &mut buf,
+        )?;
+
+        Ok(buf)
+    }
+
+    fn catpng_and_write(pngs: &[(Vec<u8>, &str)], level: u8) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        write_png(
+            catpng(
+                pngs.into_iter()
+                    .map(|(buf, path)| (Cursor::new(buf), PathBuf::from(path))),
+                level,
+            )?,
+            &mut out,
+        )?;
+        Ok(out)
+    }
+
+    #[test]
+    fn concat_1() -> Result<()> {
+        let buf = png_vec(ihdr! {69, 50, 0, 0, 0, 0, 0}, &[1, 2, 3], 0)?;
+        let expected = buf.clone();
+
+        let out = catpng_and_write(&[(buf, "1")], 0)?;
+        assert_eq!(&out, &expected);
+
+        Ok(())
+    }
+
+    #[test]
+    fn concat_2() -> Result<()> {
+        let buf1 = png_vec(ihdr! {69, 25, 0, 0, 0, 0, 0}, &[1, 2, 3], 0)?;
+        let buf2 = png_vec(ihdr! {69, 30, 0, 0, 0, 0, 0}, &[4, 5, 6], 0)?;
+        let expected = png_vec(ihdr! {69, 55, 0, 0, 0, 0, 0}, &[1, 2, 3, 4, 5, 6], 0)?;
+
+        let out = catpng_and_write(&[(buf1, "1"), (buf2, "2")], 0)?;
+        assert_eq!(&out, &expected);
+
+        Ok(())
+    }
 }
